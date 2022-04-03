@@ -77,10 +77,10 @@ static void prefetching_all(char *host);
 
 int main(int argc, char **argv){
     int client_listenfd, cfd=-1, port, clientlen = sizeof(struct sockaddr_in);
-    int timeout = 0;
+    int timeout = 0, status;
     struct timespec now, start;
     struct sockaddr_in clientaddr;
-    pid_t ppid = getpid();
+    pid_t pid;
     if (argc > 3){
         fprintf(stderr, "usage: %s <port> <timeout>\n", argv[0]);
         exit(0);
@@ -97,8 +97,10 @@ int main(int argc, char **argv){
         cfd = accept(client_listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
         handle_request(cfd, port);
     }
-    printf("Parent: %d, %d exiting\n", ppid, getpid());
-    wait(NULL);
+    while ((pid=waitpid(-1,&status,0))!=-1) {
+        printf("Child %d terminated\n",pid);
+    }
+    printf("Parent: %d terminated\n", getpid());
 }
 
 /*
@@ -114,7 +116,8 @@ static void handle_request(int cfd, int port){
         char buf[MAXLINE];
         clnt_rq_t client_request;
         err_code_t err;
-        int sfd=-1;
+        int sfd=-1, status;
+        pid_t pid;
         memset(&client_request, 0, sizeof(client_request));
         CHECK(read(cfd, buf, MAXLINE));
         parse_client_request(buf, &client_request);
@@ -126,7 +129,11 @@ static void handle_request(int cfd, int port){
         server_close(sfd);
         client_close(cfd);
         closelog();
-        wait(NULL);
+        while ((pid=waitpid(-1,&status,0))!=-1) {
+            printf("Grand Child %d terminated\n",pid);
+        }        
+        printf("child %d terminated\n", getpid());
+        exit(0);
     }
 }
 
@@ -335,7 +342,7 @@ void get_dns_from_cache(char *server_node, in_addr_t *s_addr){
     if((fread(dns_buf, 1, MAXBUF, dns_fd))>0){
         *s_addr = strtol(dns_buf,&endptr,10);
     }
-    //printf("CACHE_DNS: %s Sent From Cache\n", server_node);
+    printf("CACHE_DNS: %s Sent From Cache\n", server_node);
 
 }
 
@@ -376,13 +383,12 @@ void server_response(clnt_rq_t client_request, int cfd, int sfd, err_code_t err)
         caching(r_buf, client_request.URL, content_len, cache_fp,need_cached,cache_name);
         CHECK(send(cfd, r_buf, content_len, 0));
     }
-    //printf("SERVER: Sent From Remote Server %s\n ", client_request.URL);
+    printf("SERVER: Sent From Remote Server %s\n ", client_request.URL);
     //syslog(LOG_INFO, "%s->%s is CACHED", client_request.URL, cache_name);
     if(need_cached){
-        //printf("CACHE_PAGE: %s->%s is Cached\n", client_request.URL, cache_name);
+        printf("CACHE_PAGE: %s->%s is Cached\n", client_request.URL, cache_name);
         fclose(cache_fp);
-    } 
-
+    }
 }
 
 void caching(char *buf, char *URL, int content_len, FILE *cache_fp, bool need_cache, char *cache_name){
@@ -401,6 +407,7 @@ void prefetching_all(char *host){
     if(fork()==0){
         lookup_html(host);
         closelog();
+        printf("grandchild exiting %d\n", getpid());
         exit(0);
     }
 }
@@ -565,7 +572,7 @@ void prefetching(char *url, char *host){
         fwrite(r_buf,1,content_len, prefect_fp);
     }
     fclose(prefect_fp);
-    //printf("PREFETCH: %s->%s Prefetched\n", link,cache_name);
+    printf("PREFETCH: %s->%s Prefetched\n", link,cache_name);
     //syslog(LOG_INFO, "%s->%s is PREFETCHED", link, cache_name);
     server_close(sfd);
 }

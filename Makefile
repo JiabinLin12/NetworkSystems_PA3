@@ -7,7 +7,7 @@ all: touch webproxy
 webproxy: webproxy.c
 	$(CC) webproxy.c $(CFLAGS) -o webproxy
 	clear
-	./webproxy 8888 60
+	./webproxy 8888 20
 	
 touch:
 	touch webproxy.c
