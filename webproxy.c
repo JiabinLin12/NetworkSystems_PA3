@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <syslog.h>
+#include <signal.h>
 
 #define DEFAULT_PORT 80
 #define MAXLINE 2048
@@ -51,8 +52,13 @@ typedef enum err_code {
     SUCCESS, 
 }err_code_t;
 
+typedef struct cpid_node {
+    pid_t cpid;
+    struct cpid_node *next;
+}cpid_node_t;
+
 static int client_connection(int port);
-static void handle_request(int cfd, int port);
+static void handle_request(int cfd, int port,cpid_node_t **head_node, int *pipefd);
 static void error_handling(int cfd, err_code_t err);
 static void server_connection(char *server_node, int *sfd, int cfd, err_code_t *err);
 static void server_response(clnt_rq_t client_request, int cfd,int sfd, err_code_t err);
@@ -73,18 +79,27 @@ static void lookup_html(char *host);
 static void prefetch_connection(char *server_node, int *sfd);
 static void prefetching(char *url, char *host);
 static void prefetching_all(char *host);
+static void add_cpid(cpid_node_t **head_node, pid_t cpid);
+static void remove_cpid(cpid_node_t **head_node, pid_t cpid);
+static void remove_all_cpid(cpid_node_t **head_node);
+static void child_state(int *pipefd,cpid_node_t **head_node);
+static void open_pipe(int *pipe_fd);
+static void parent_exiting(pid_t pid, int pipe_fdw);
 
 
 int main(int argc, char **argv){
     int client_listenfd, cfd=-1, port, clientlen = sizeof(struct sockaddr_in);
-    int timeout = 0, status;
+    int timeout = 0;
     struct timespec now, start;
     struct sockaddr_in clientaddr;
-    pid_t pid;
+    pid_t pid = getpid();
     if (argc > 3){
         fprintf(stderr, "usage: %s <port> <timeout>\n", argv[0]);
         exit(0);
     }
+    cpid_node_t *cpid_head = NULL;
+    int pipe_fd[2];
+    open_pipe(pipe_fd);
     system("rm -rf cache dns_cache");
     port = (argc==1) ? DEFAULT_PORT:atoi(argv[1]);    
     timeout = (argc==3)? atoi(argv[2]):DEFAULT_TIMEOUT;
@@ -93,14 +108,94 @@ int main(int argc, char **argv){
     clock_gettime(CLOCK_REALTIME, &now);
     client_listenfd = client_connection(port);
     while (((now.tv_sec - start.tv_sec) < timeout)){
+        child_state(pipe_fd,&cpid_head);
         clock_gettime(CLOCK_REALTIME, &now);
         cfd = accept(client_listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
-        handle_request(cfd, port);
+        handle_request(cfd, port,&cpid_head,pipe_fd);
     }
-    while ((pid=waitpid(-1,&status,0))!=-1) {
-        printf("Child %d terminated\n",pid);
+    remove_all_cpid(&cpid_head);
+    parent_exiting(pid, pipe_fd[1]);
+}
+
+void travese_cpid(cpid_node_t *head_node){
+    printf("link list:");
+    cpid_node_t *temp =head_node ;
+    while(temp!=NULL){
+        printf("%d ", temp->cpid);
+        temp=temp->next;
     }
-    printf("Parent: %d terminated\n", getpid());
+    printf("\n");
+}
+
+void add_cpid(cpid_node_t **head_node, pid_t cpid){
+    cpid_node_t *temp = (*head_node);
+    cpid_node_t *new_node = NULL;
+    if((*head_node)==NULL){
+        (*head_node) = (cpid_node_t *)malloc(sizeof(cpid_node_t));
+        (*head_node)->cpid = cpid;
+        (*head_node)->next = NULL;
+        printf("cpid %d added\n",(*head_node)->cpid);
+        return;
+    }
+    while(temp->next != NULL){
+        temp = temp->next;
+    }
+    new_node = (cpid_node_t *)malloc(sizeof(cpid_node_t));
+    new_node->next = NULL;
+    new_node->cpid = cpid;
+    temp->next = new_node;
+    printf("cpid %d added\n",temp->cpid);
+}
+
+
+
+void remove_cpid(cpid_node_t **head_node, pid_t cpid){
+    cpid_node_t *temp = *head_node; 
+    cpid_node_t *rm_node = NULL; 
+    if((*head_node)==NULL){
+        printf("no available cpid\n");
+        return;
+    }
+    if(temp->cpid==cpid){
+        (*head_node) = (*head_node)->next;
+        free(temp);
+        printf("cpid %d removed\n",cpid);
+        return;
+    }
+    
+    while(temp->next!=NULL){
+        if((temp->next->cpid)==cpid){
+            rm_node = temp->next;
+            temp->next = temp->next->next;
+            free(rm_node);
+            rm_node = NULL;
+            printf("cpid %d removed\n",cpid);
+            break;
+        };
+        temp = temp->next;
+    }
+}
+
+void remove_all_cpid(cpid_node_t **head_node){
+    cpid_node_t *temp=NULL;
+    while((*head_node)!=NULL){
+        temp = (*head_node);
+        *head_node = (*head_node)->next;
+        kill(temp->cpid, SIGKILL);
+        printf("cpid %d terminated\n", temp->cpid);
+        free(temp);
+    }
+}
+
+
+static void child_state(int *pipefd,cpid_node_t **head_node){
+    pid_t cpid = -1;
+    
+    //read at parents
+    read(pipefd[0], &cpid, sizeof(int));
+    if(cpid!=-1){
+        remove_cpid(head_node, cpid);
+    }
 }
 
 /*
@@ -108,10 +203,12 @@ int main(int argc, char **argv){
  * request parse, request connection state
  * transfer file and clean up
  */
-static void handle_request(int cfd, int port){
+static void handle_request(int cfd, int port, cpid_node_t **head_node, int *pipefd){ 
+    pid_t child_pid = -1;
     if(cfd==-1)
         return;
-    if((fork())==0){
+    if((child_pid = fork())==0){
+        pid_t cpid = getpid();
         openlog("webproxy:child", LOG_PID, LOG_USER);
         char buf[MAXLINE];
         clnt_rq_t client_request;
@@ -132,10 +229,17 @@ static void handle_request(int cfd, int port){
         while ((pid=waitpid(-1,&status,0))!=-1) {
             printf("Grand Child %d terminated\n",pid);
         }        
-        printf("child %d terminated\n", getpid());
+        close(pipefd[0]);
+        write(pipefd[1],&cpid,sizeof(int));
+        close(pipefd[1]);
         exit(0);
+    }else if(child_pid!=-1){
+        add_cpid(head_node, child_pid);
     }
 }
+
+
+
 
 static void host_lookup(char *in,clnt_rq_t *rq){
     char in_cp[MAXBUF];
@@ -597,4 +701,20 @@ void prefetch_connection(char *server_node, int *sfd){
     server.sin_addr.s_addr = *((unsigned long *)hostnm->h_addr);    
     CHECK(*sfd = socket(AF_INET, SOCK_STREAM, 0));
     CHECK(connect(*sfd, (struct sockaddr *)&server, sizeof(server)));   
+}
+
+void open_pipe(int *pipe_fd){
+    int flags;
+    CHECK(pipe(pipe_fd));
+    flags = CHECK(fcntl(*pipe_fd,F_GETFL));
+    CHECK(fcntl(*pipe_fd,F_SETFL, flags | O_NONBLOCK));
+}
+
+static void parent_exiting(pid_t pid, int pipe_fdw){
+    if(pid!=0){
+        wait(NULL);
+        if(pipe_fdw!=-1)
+            close(pipe_fdw);
+        printf("Connection:Close\n");
+    }
 }
